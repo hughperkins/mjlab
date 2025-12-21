@@ -53,7 +53,7 @@ class MujocoCfg:
   # Solver settings.
   jacobian: Literal["auto", "dense", "sparse"] = "auto"
   solver: Literal["newton", "cg", "pgs"] = "newton"
-  iterations: int = 100
+  iterations: int = 5
   tolerance: float = 1e-8
   ls_iterations: int = 50
   ls_tolerance: float = 0.01
@@ -88,7 +88,8 @@ class SimulationCfg:
   
   Constraint arrays are batched by world: no world may have more than njmax
   constraints. If None, a heuristic value is used."""
-  ls_parallel: bool = True  # Boosts perf quite noticeably.
+  # ls_parallel: bool = True  # Boosts perf quite noticeably.
+  ls_parallel: bool = False  # Boosts perf quite noticeably.
   contact_sensor_maxmatch: int = 64
   mujoco: MujocoCfg = field(default_factory=MujocoCfg)
   nan_guard: NanGuardCfg = field(default_factory=NanGuardCfg)
@@ -131,11 +132,13 @@ class Simulation:
     self.use_cuda_graph = self.wp_device.is_cuda and wp.is_mempool_enabled(
       self.wp_device
     )
+    self.use_cuda_graph = False
     self.create_graph()
 
     self.nan_guard = NanGuard(cfg.nan_guard, self.num_envs, self._mj_model)
 
   def create_graph(self) -> None:
+    print("create_graph")
     self.step_graph = None
     self.forward_graph = None
     if self.use_cuda_graph:

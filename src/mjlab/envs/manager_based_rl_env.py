@@ -259,6 +259,7 @@ class ManagerBasedRlEnv:
     env_ids: torch.Tensor | None = None,
     options: dict[str, Any] | None = None,
   ) -> tuple[types.VecEnvObs, dict]:
+    print("ManagerBasedRlEnv.reset()")
     del options  # Unused.
     if env_ids is None:
       env_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
@@ -271,14 +272,39 @@ class ManagerBasedRlEnv:
     return self.obs_buf, self.extras
 
   def step(self, action: torch.Tensor) -> types.VecEnvStepReturn:
+    # import time
+    # print("ManagerBasedRlEnv.step()")
+    # wp.synchronize()
+    # start = time.time()
     self.action_manager.process_action(action.to(self.device))
+    # wp.synchronize()
+    # end = time.time()
+    # print("1 process action", end - start)
+    # start = end
 
+    # print("self.cfg.decimation", self.cfg.decimation)
     for _ in range(self.cfg.decimation):
       self._sim_step_counter += 1
       self.action_manager.apply_action()
+      # wp.synchronize()
+      # end = time.time()
+      # print("apply action", end - start)
+      # start = end
       self.scene.write_data_to_sim()
+      # wp.synchronize()
+      # end = time.time()
+      # print("write_data_to_sim", end - start)
+      # start = end
       self.sim.step()
+      # wp.synchronize()
+      # end = time.time()
+      # print("sim.step()", end - start)
+      # start = end
       self.scene.update(dt=self.physics_dt)
+      # wp.synchronize()
+      # end = time.time()
+      # print("scene.update()", end - start)
+      # start = end
 
     # Update env counters.
     self.episode_length_buf += 1
@@ -304,6 +330,11 @@ class ManagerBasedRlEnv:
       self.event_manager.apply(mode="interval", dt=self.step_dt)
 
     self.obs_buf = self.observation_manager.compute(update_history=True)
+
+    # wp.synchronize()
+    # end = time.time()
+    # # print("second section of step()", end - start)
+    # start = end
 
     return (
       self.obs_buf,
