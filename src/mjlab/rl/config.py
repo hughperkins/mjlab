@@ -71,7 +71,7 @@ class RslRlBaseRunnerCfg:
   """The seed for the experiment. Default is 42."""
   num_steps_per_env: int = 24
   """The number of steps per environment update."""
-  max_iterations: int = 300
+  max_iterations: int = 5
   """The maximum number of iterations."""
   obs_groups: dict[str, tuple[str, ...]] = field(
     default_factory=lambda: {"policy": ("policy",), "critic": ("critic",)},
