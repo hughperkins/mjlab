@@ -1,5 +1,7 @@
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import mujoco
@@ -39,6 +41,42 @@ from mjlab.viewer.offscreen_renderer import OffscreenRenderer
 from mjlab.viewer.viewer_config import ViewerConfig
 
 
+@dataclass
+class ProfilerConfig:
+  """Configuration for PyTorch profiler.
+  
+  When enabled, the profiler will trace each environment step and can help identify
+  performance bottlenecks in the forward pass.
+  """
+
+  enabled: bool = False
+  """Whether to enable the PyTorch profiler."""
+  
+  wait_steps: int = 50
+  """Number of steps to skip before starting profiling."""
+  
+  warmup_steps: int = 10
+  """Number of steps for warmup (profiler active but not recording)."""
+  
+  active_steps: int = 1
+  """Number of steps to actively profile."""
+  
+  repeat: int = 1
+  """Number of times to repeat the profiling cycle."""
+  
+  record_shapes: bool = False
+  """Whether to record tensor shapes."""
+  
+  profile_memory: bool = False
+  """Whether to profile memory usage."""
+  
+  with_stack: bool = True
+  """Whether to record stack traces (can be expensive)."""
+  
+  output_trace_path: str = "pull/trace.json"
+  """Path to save the Chrome trace JSON file."""
+
+
 @dataclass(kw_only=True)
 class ManagerBasedRlEnvCfg:
   """Configuration for a manager-based RL environment."""
@@ -60,6 +98,8 @@ class ManagerBasedRlEnvCfg:
   seed: int | None = None
   sim: SimulationCfg = field(default_factory=SimulationCfg)
   viewer: ViewerConfig = field(default_factory=ViewerConfig)
+  profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+  """PyTorch profiler configuration for performance analysis."""
 
   # RL-specific configuration.
   episode_length_s: float = 0.0
@@ -112,6 +152,33 @@ class ManagerBasedRlEnv:
     self._sim_step_counter = 0
     self.extras = {}
     self.obs_buf = {}
+
+    # Initialize PyTorch profiler if enabled.
+    self._profiler = None
+    self._profiler_step = 0
+    if self.cfg.profiler.enabled:
+      from torch.profiler import ProfilerActivity, profile, schedule
+      
+      output_trace_path = Path(self.cfg.profiler.output_trace_path)
+      output_trace_path.parent.mkdir(parents=True, exist_ok=True)
+      
+      profiler_schedule = schedule(
+        wait=self.cfg.profiler.wait_steps,
+        warmup=self.cfg.profiler.warmup_steps,
+        active=self.cfg.profiler.active_steps,
+        repeat=self.cfg.profiler.repeat,
+      )
+      
+      self._profiler = profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=profiler_schedule,
+        record_shapes=self.cfg.profiler.record_shapes,
+        profile_memory=self.cfg.profiler.profile_memory,
+        with_stack=self.cfg.profiler.with_stack,
+      )
+      self._profiler.__enter__()
+      print_info(f"[INFO] PyTorch profiler enabled. Trace will be saved to: {output_trace_path}")
+
 
     # Initialize scene and simulation.
     self.scene = Scene(self.cfg.scene, device=device)
@@ -271,39 +338,49 @@ class ManagerBasedRlEnv:
     return self.obs_buf, self.extras
 
   def step(self, action: torch.Tensor) -> types.VecEnvStepReturn:
-    self.action_manager.process_action(action.to(self.device))
+    # Use profiler context if enabled, otherwise use nullcontext.
+    profiler_context = (
+      self._profiler.step if self._profiler is not None else nullcontext
+    )
+    
+    with profiler_context():
+      self.action_manager.process_action(action.to(self.device))
 
-    for _ in range(self.cfg.decimation):
-      self._sim_step_counter += 1
-      self.action_manager.apply_action()
-      self.scene.write_data_to_sim()
-      self.sim.step()
-      self.scene.update(dt=self.physics_dt)
+      for _ in range(self.cfg.decimation):
+        self._sim_step_counter += 1
+        self.action_manager.apply_action()
+        self.scene.write_data_to_sim()
+        self.sim.step()
+        self.scene.update(dt=self.physics_dt)
 
-    # Update env counters.
-    self.episode_length_buf += 1
-    self.common_step_counter += 1
+      # Update env counters.
+      self.episode_length_buf += 1
+      self.common_step_counter += 1
 
-    # Check terminations.
-    self.reset_buf = self.termination_manager.compute()
-    self.reset_terminated = self.termination_manager.terminated
-    self.reset_time_outs = self.termination_manager.time_outs
+      # Check terminations.
+      self.reset_buf = self.termination_manager.compute()
+      self.reset_terminated = self.termination_manager.terminated
+      self.reset_time_outs = self.termination_manager.time_outs
 
-    self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
+      self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
 
-    # Reset envs that terminated/timed-out and log the episode info.
-    reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-    if len(reset_env_ids) > 0:
-      self._reset_idx(reset_env_ids)
-      self.scene.write_data_to_sim()
-      self.sim.forward()
+      # Reset envs that terminated/timed-out and log the episode info.
+      reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+      if len(reset_env_ids) > 0:
+        self._reset_idx(reset_env_ids)
+        self.scene.write_data_to_sim()
+        self.sim.forward()
 
-    self.command_manager.compute(dt=self.step_dt)
+      self.command_manager.compute(dt=self.step_dt)
 
-    if "interval" in self.event_manager.available_modes:
-      self.event_manager.apply(mode="interval", dt=self.step_dt)
+      if "interval" in self.event_manager.available_modes:
+        self.event_manager.apply(mode="interval", dt=self.step_dt)
+  
+      self.obs_buf = self.observation_manager.compute(update_history=True)
 
-    self.obs_buf = self.observation_manager.compute(update_history=True)
+    # Increment profiler step counter.
+    if self._profiler is not None:
+      self._profiler_step += 1
 
     return (
       self.obs_buf,
@@ -333,6 +410,11 @@ class ManagerBasedRlEnv:
   def close(self) -> None:
     if self._offline_renderer is not None:
       self._offline_renderer.close()
+    if self._profiler is not None:
+      self._profiler.__exit__(None, None, None)
+      output_trace_path = Path(self.cfg.profiler.output_trace_path)
+      self._profiler.export_chrome_trace(str(output_trace_path))
+      print_info(f"[INFO] PyTorch profiler trace saved to: {output_trace_path}")
 
   @staticmethod
   def seed(seed: int = -1) -> int:
