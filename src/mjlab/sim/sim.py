@@ -157,7 +157,10 @@ class Simulation:
     self._model_bridge = WarpBridge(self._wp_model, nworld=self.num_envs)
     self._data_bridge = WarpBridge(self._wp_data)
 
-    self.use_cuda_graph = self._should_use_cuda_graph()
+    self.use_cuda_graph = self.wp_device.is_cuda and wp.is_mempool_enabled(
+      self.wp_device
+    )
+    self.use_cuda_graph = False
     self.create_graph()
 
     self.nan_guard = NanGuard(cfg.nan_guard, self.num_envs, self._mj_model)
@@ -268,7 +271,7 @@ class Simulation:
   def step(self) -> None:
     with wp.ScopedDevice(self.wp_device):
       with self.nan_guard.watch(self.data):
-        if self.use_cuda_graph and self.step_graph is not None:
+        if self.use_cuda_graph and self.step_graph is not None and False:
           wp.capture_launch(self.step_graph)
         else:
           mjwarp.step(self.wp_model, self.wp_data)
