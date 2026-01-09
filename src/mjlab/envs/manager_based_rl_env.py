@@ -1,5 +1,4 @@
 import math
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -386,48 +385,44 @@ class ManagerBasedRlEnv:
     return self.obs_buf, self.extras
 
   def step(self, action: torch.Tensor) -> types.VecEnvStepReturn:
-    # Use profiler context if enabled, otherwise use nullcontext.
-    profiler_context = (
-      self._profiler.step if self._profiler is not None else nullcontext
-    )
-    
-    with profiler_context():
-      self.action_manager.process_action(action.to(self.device))
+    self.action_manager.process_action(action.to(self.device))
 
-      for _ in range(self.cfg.decimation):
-        self._sim_step_counter += 1
-        self.action_manager.apply_action()
-        self.scene.write_data_to_sim()
-        self.sim.step()
-        self.scene.update(dt=self.physics_dt)
+    for _ in range(self.cfg.decimation):
+      self._sim_step_counter += 1
+      self.action_manager.apply_action()
+      self.scene.write_data_to_sim()
+      self.sim.step()
+      self.scene.update(dt=self.physics_dt)
 
-      # Update env counters.
-      self.episode_length_buf += 1
-      self.common_step_counter += 1
+    # Update env counters.
+    self.episode_length_buf += 1
+    self.common_step_counter += 1
 
-      # Check terminations.
-      self.reset_buf = self.termination_manager.compute()
-      self.reset_terminated = self.termination_manager.terminated
-      self.reset_time_outs = self.termination_manager.time_outs
+    # Check terminations.
+    self.reset_buf = self.termination_manager.compute()
+    self.reset_terminated = self.termination_manager.terminated
+    self.reset_time_outs = self.termination_manager.time_outs
 
-      self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
+    self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
 
-      # Reset envs that terminated/timed-out and log the episode info.
-      reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-      if len(reset_env_ids) > 0:
-        self._reset_idx(reset_env_ids)
-        self.scene.write_data_to_sim()
-        self.sim.forward()
+    # Reset envs that terminated/timed-out and log the episode info.
+    reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+    if len(reset_env_ids) > 0:
+      self._reset_idx(reset_env_ids)
+      self.scene.write_data_to_sim()
+      self.sim.forward()
 
-      self.command_manager.compute(dt=self.step_dt)
+    self.command_manager.compute(dt=self.step_dt)
 
-      if "interval" in self.event_manager.available_modes:
-        self.event_manager.apply(mode="interval", dt=self.step_dt)
-  
-      self.obs_buf = self.observation_manager.compute(update_history=True)
+    if "interval" in self.event_manager.available_modes:
+      self.event_manager.apply(mode="interval", dt=self.step_dt)
 
-    # Increment profiler step counter.
+    self.obs_buf = self.observation_manager.compute(update_history=True)
+
+    # Advance profiler step counter if enabled.
     if self._profiler is not None:
+      wp.synchronize_device(self.sim.wp_device)
+      self._profiler.step()
       self._profiler_step += 1
 
     return (
