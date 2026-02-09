@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import os
 from typing import TYPE_CHECKING, Literal, cast
 
 import mujoco
@@ -160,7 +161,8 @@ class Simulation:
     self.use_cuda_graph = self.wp_device.is_cuda and wp.is_mempool_enabled(
       self.wp_device
     )
-    self.use_cuda_graph = False
+    self.use_cuda_graph = os.environ.get("MJLAB_CUDA_GRAPH", "1") == "1"
+    print("use cuda graph", self.use_cuda_graph, "(modify using MJLAB_CUDA_GRAPH)")
     self.create_graph()
 
     self.nan_guard = NanGuard(cfg.nan_guard, self.num_envs, self._mj_model)
@@ -271,7 +273,7 @@ class Simulation:
   def step(self) -> None:
     with wp.ScopedDevice(self.wp_device):
       with self.nan_guard.watch(self.data):
-        if self.use_cuda_graph and self.step_graph is not None and False:
+        if self.use_cuda_graph and self.step_graph is not None:
           wp.capture_launch(self.step_graph)
         else:
           mjwarp.step(self.wp_model, self.wp_data)

@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import os
 
 import mujoco
 import numpy as np
@@ -37,6 +38,10 @@ from mjlab.utils.spaces import Dict as DictSpace
 from mjlab.viewer.debug_visualizer import DebugVisualizer
 from mjlab.viewer.offscreen_renderer import OffscreenRenderer
 from mjlab.viewer.viewer_config import ViewerConfig
+
+
+sync_kernel_launches = os.environ.get("MJLAB_SYNC_LAUNCHES", "0") == 1
+print("sync_kernel_launches", sync_kernel_launches, "(change with MJLAB_SYNC_LAUNCHES)")
 
 
 @dataclass
@@ -421,7 +426,8 @@ class ManagerBasedRlEnv:
 
     # Advance profiler step counter if enabled.
     if self._profiler is not None:
-      wp.synchronize_device(self.sim.wp_device)
+      if sync_kernel_launches:
+        wp.synchronize_device(self.sim.wp_device)
       self._profiler.step()
       self._profiler_step += 1
 
