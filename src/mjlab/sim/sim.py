@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from typing import TYPE_CHECKING, Literal, cast
 
 import mujoco
@@ -196,7 +197,11 @@ class Simulation:
     self._data_bridge = WarpBridge(self._wp_data)
     self._sensor_context: SensorContext | None = None
 
-    self.use_cuda_graph = self._should_use_cuda_graph()
+    self.use_cuda_graph = self.wp_device.is_cuda and wp.is_mempool_enabled(
+      self.wp_device
+    )
+    self.use_cuda_graph = os.environ.get("MJLAB_CUDA_GRAPH", "1") == "1"
+    print("use cuda graph", self.use_cuda_graph, "(modify using MJLAB_CUDA_GRAPH)")
     self.create_graph()
 
     self.nan_guard = NanGuard(cfg.nan_guard, self.num_envs, self._mj_model)
