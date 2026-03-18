@@ -1,8 +1,9 @@
+import gzip
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-import os
 
 import mujoco
 import numpy as np
@@ -44,7 +45,6 @@ from mjlab.viewer.debug_visualizer import DebugVisualizer
 from mjlab.viewer.offscreen_renderer import OffscreenRenderer
 from mjlab.viewer.viewer_config import ViewerConfig
 
-
 sync_kernel_launches = os.environ.get("MJLAB_SYNC_LAUNCHES", "0") == 1
 print("sync_kernel_launches", sync_kernel_launches, "(change with MJLAB_SYNC_LAUNCHES)")
 
@@ -52,37 +52,38 @@ print("sync_kernel_launches", sync_kernel_launches, "(change with MJLAB_SYNC_LAU
 @dataclass
 class ProfilerConfig:
   """Configuration for PyTorch profiler.
-  
+
   When enabled, the profiler will trace each environment step and can help identify
   performance bottlenecks in the forward pass.
   """
 
   enabled: bool = False
   """Whether to enable the PyTorch profiler."""
-  
+
   wait_steps: int = 50
   """Number of steps to skip before starting profiling."""
-  
+
   warmup_steps: int = 10
   """Number of steps for warmup (profiler active but not recording)."""
-  
+
   active_steps: int = 1
   """Number of steps to actively profile."""
-  
+
   repeat: int = 1
   """Number of times to repeat the profiling cycle."""
-  
+
   record_shapes: bool = False
   """Whether to record tensor shapes."""
-  
+
   profile_memory: bool = False
   """Whether to profile memory usage."""
-  
+
   with_stack: bool = True
   """Whether to record stack traces (can be expensive)."""
-  
-  output_trace_path: str = "pull/trace.json"
-  """Path to save the Chrome trace JSON file."""
+
+  ref: str = "trace"
+  """Reference name for the trace file. The trace is written to
+  ``{cwd}/../tmp/{ref}.json.gz``."""
 
 
 @dataclass(kw_only=True)
@@ -217,17 +218,18 @@ class ManagerBasedRlEnv:
     self._profiler_step = 0
     if self.cfg.profiler.enabled:
       from torch.profiler import ProfilerActivity, profile, schedule
-      
-      output_trace_path = Path(self.cfg.profiler.output_trace_path)
+
+      output_trace_path = Path.cwd().parent / "tmp" / f"{self.cfg.profiler.ref}.json.gz"
       output_trace_path.parent.mkdir(parents=True, exist_ok=True)
-      
+      self._profiler_output_path = output_trace_path
+
       profiler_schedule = schedule(
         wait=self.cfg.profiler.wait_steps,
         warmup=self.cfg.profiler.warmup_steps,
         active=self.cfg.profiler.active_steps,
         repeat=self.cfg.profiler.repeat,
       )
-      
+
       self._profiler = profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=profiler_schedule,
@@ -236,8 +238,9 @@ class ManagerBasedRlEnv:
         with_stack=self.cfg.profiler.with_stack,
       )
       self._profiler.__enter__()
-      print_info(f"[INFO] PyTorch profiler enabled. Trace will be saved to: {output_trace_path}")
-
+      print_info(
+        f"[INFO] PyTorch profiler enabled. Trace will be saved to: {output_trace_path}"
+      )
 
     # Initialize scene and simulation.
     self.scene = Scene(self.cfg.scene, device=device)
@@ -520,9 +523,14 @@ class ManagerBasedRlEnv:
       self._offline_renderer.close()
     if self._profiler is not None:
       self._profiler.__exit__(None, None, None)
-      output_trace_path = Path(self.cfg.profiler.output_trace_path)
-      self._profiler.export_chrome_trace(str(output_trace_path))
-      print_info(f"[INFO] PyTorch profiler trace saved to: {output_trace_path}")
+      output_path = self._profiler_output_path
+      json_path = output_path.with_suffix("")
+      self._profiler.export_chrome_trace(str(json_path))
+      with open(json_path, "rb") as f_in:
+        with gzip.open(output_path, "wb") as f_out:
+          f_out.write(f_in.read())
+      json_path.unlink()
+      print_info(f"[INFO] PyTorch profiler trace saved to: {output_path}")
 
   @staticmethod
   def seed(seed: int = -1) -> int:
