@@ -53,17 +53,17 @@ print("sync_kernel_launches", sync_kernel_launches, "(change with MJLAB_SYNC_LAU
 class ProfilerConfig:
   """Configuration for PyTorch profiler.
 
-  When enabled, the profiler will trace each environment step and can help identify
-  performance bottlenecks in the forward pass.
+  When enabled, the profiler advances once per sim substep (inside the
+  decimation loop), so schedule counts are in units of ``sim.step()``.
   """
 
   enabled: bool = False
   """Whether to enable the PyTorch profiler."""
 
-  wait_steps: int = 50
+  wait_steps: int = 275
   """Number of steps to skip before starting profiling."""
 
-  warmup_steps: int = 10
+  warmup_steps: int = 1
   """Number of steps for warmup (profiler active but not recording)."""
 
   active_steps: int = 1
@@ -449,6 +449,11 @@ class ManagerBasedRlEnv:
       self.scene.write_data_to_sim()
       self.sim.step()
       self.scene.update(dt=self.physics_dt)
+      if self._profiler is not None:
+        if sync_kernel_launches:
+          wp.synchronize_device(self.sim.wp_device)
+        self._profiler.step()
+        self._profiler_step += 1
 
     # Update env counters.
     self.episode_length_buf += 1
@@ -485,13 +490,6 @@ class ManagerBasedRlEnv:
 
     self.sim.sense()
     self.obs_buf = self.observation_manager.compute(update_history=True)
-
-    # Advance profiler step counter if enabled.
-    if self._profiler is not None:
-      if sync_kernel_launches:
-        wp.synchronize_device(self.sim.wp_device)
-      self._profiler.step()
-      self._profiler_step += 1
 
     return (
       self.obs_buf,
