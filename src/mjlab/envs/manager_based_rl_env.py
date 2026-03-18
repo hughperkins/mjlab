@@ -1,3 +1,4 @@
+import csv
 import gzip
 import math
 import os
@@ -84,6 +85,10 @@ class ProfilerConfig:
   ref: str = "trace"
   """Reference name for the trace file. The trace is written to
   ``{cwd}/../tmp/{ref}.json.gz``."""
+
+  dump_contacts: bool = False
+  """When enabled, write a CSV with columns ``step,n_contacts,n_constraints``
+  (one row per sim substep) to ``{cwd}/../tmp/{ref}_contacts.csv``."""
 
 
 @dataclass(kw_only=True)
@@ -212,6 +217,10 @@ class ManagerBasedRlEnv:
     self._sim_step_counter = 0
     self.extras = {}
     self.obs_buf = {}
+
+    # Contact dump state (independent of profiler).
+    self._contact_log: list[tuple[int, int, int]] = []
+    self._contact_step = 0
 
     # Initialize PyTorch profiler if enabled.
     self._profiler = None
@@ -449,6 +458,12 @@ class ManagerBasedRlEnv:
       self.scene.write_data_to_sim()
       self.sim.step()
       self.scene.update(dt=self.physics_dt)
+      if self.cfg.profiler.dump_contacts:
+        wp.synchronize_device(self.sim.wp_device)
+        ncon = int(self.sim.wp_data.nacon.numpy()[0])
+        nefc = int(self.sim.wp_data.nefc.numpy().sum())
+        self._contact_log.append((self._contact_step, ncon, nefc))
+        self._contact_step += 1
       if self._profiler is not None:
         if sync_kernel_launches:
           wp.synchronize_device(self.sim.wp_device)
@@ -519,6 +534,14 @@ class ManagerBasedRlEnv:
   def close(self) -> None:
     if self._offline_renderer is not None:
       self._offline_renderer.close()
+    if self._contact_log:
+      csv_path = Path.cwd().parent / "tmp" / f"{self.cfg.profiler.ref}_contacts.csv"
+      csv_path.parent.mkdir(parents=True, exist_ok=True)
+      with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(("step", "n_contacts", "n_constraints"))
+        writer.writerows(self._contact_log)
+      print_info(f"[INFO] Contact log saved to: {csv_path}")
     if self._profiler is not None:
       self._profiler.__exit__(None, None, None)
       output_path = self._profiler_output_path
