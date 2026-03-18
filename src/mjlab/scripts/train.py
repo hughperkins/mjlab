@@ -9,10 +9,9 @@ from pathlib import Path
 from typing import Literal, cast
 
 import tyro
-from rsl_rl.runners import OnPolicyRunner
 
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
-from mjlab.rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+from mjlab.rl import MjlabOnPolicyRunner, RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.gpu import select_gpus
@@ -25,7 +24,7 @@ from mjlab.utils.wrappers import VideoRecorder
 @dataclass(frozen=True)
 class TrainConfig:
   env: ManagerBasedRlEnvCfg
-  agent: RslRlOnPolicyRunnerCfg
+  agent: RslRlBaseRunnerCfg
   registry_name: str | None = None
   video: bool = False
   video_length: int = 200
@@ -33,13 +32,14 @@ class TrainConfig:
   enable_nan_guard: bool = False
   torchrunx_log_dir: str | None = None
   wandb_run_path: str | None = None
+  wandb_checkpoint_name: str | None = None
+  """Optional checkpoint name within the W&B run to load (e.g. 'model_4000.pt')."""
   gpu_ids: list[int] | Literal["all"] | None = field(default_factory=lambda: [0])
 
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
     env_cfg = load_env_cfg(task_id)
     agent_cfg = load_rl_cfg(task_id)
-    assert isinstance(agent_cfg, RslRlOnPolicyRunnerCfg)
     return TrainConfig(env=env_cfg, agent=agent_cfg)
 
 
@@ -73,21 +73,28 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   )
 
   if is_tracking_task:
-    if not cfg.registry_name:
-      raise ValueError("Must provide --registry-name for tracking tasks.")
-
-    # Check if the registry name includes alias, if not, append ":latest".
-    registry_name = cast(str, cfg.registry_name)
-    if ":" not in registry_name:
-      registry_name = registry_name + ":latest"
-    import wandb
-
-    api = wandb.Api()
-    artifact = api.artifact(registry_name)
-
     motion_cmd = cfg.env.commands["motion"]
     assert isinstance(motion_cmd, MotionCommandCfg)
-    motion_cmd.motion_file = str(Path(artifact.download()) / "motion.npz")
+
+    # Check if motion_file is already set (e.g., via CLI --env.commands.motion.motion-file).
+    if motion_cmd.motion_file and Path(motion_cmd.motion_file).exists():
+      print(f"[INFO] Using local motion file: {motion_cmd.motion_file}")
+    elif cfg.registry_name:
+      # Download from WandB registry.
+      registry_name = cast(str, cfg.registry_name)
+      if ":" not in registry_name:
+        registry_name = registry_name + ":latest"
+      import wandb
+
+      api = wandb.Api()
+      artifact = api.artifact(registry_name)
+      motion_cmd.motion_file = str(Path(artifact.download()) / "motion.npz")
+    else:
+      raise ValueError(
+        "For tracking tasks, provide either:\n"
+        "  --registry-name your-org/motions/motion-name (download from WandB)\n"
+        "  --env.commands.motion.motion-file /path/to/motion.npz (local file)"
+      )
 
   # Enable NaN guard if requested.
   if cfg.enable_nan_guard:
@@ -108,7 +115,7 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     if cfg.wandb_run_path is not None:
       # Load checkpoint from W&B.
       resume_path, was_cached = get_wandb_checkpoint_path(
-        log_root_path, Path(cfg.wandb_run_path)
+        log_root_path, Path(cfg.wandb_run_path), cfg.wandb_checkpoint_name
       )
       if rank == 0:
         run_id = resume_path.parent.name
@@ -142,11 +149,17 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
   runner_cls = load_runner_cls(task_id)
   if runner_cls is None:
-    runner_cls = OnPolicyRunner
+    runner_cls = MjlabOnPolicyRunner
 
   runner_kwargs = {}
   if is_tracking_task:
     runner_kwargs["registry_name"] = registry_name
+
+  # Write config files before runner creation, since the runner mutates agent_cfg
+  # in-place (e.g., injecting non-serializable objects).
+  if rank == 0:
+    dump_yaml(log_dir / "params" / "env.yaml", env_cfg)
+    dump_yaml(log_dir / "params" / "agent.yaml", agent_cfg)
 
   runner = runner_cls(env, agent_cfg, str(log_dir), device, **runner_kwargs)
 
@@ -155,11 +168,6 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   if resume_path is not None:
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     runner.load(str(resume_path))
-
-  # Only write config files from rank 0 to avoid race conditions.
-  if rank == 0:
-    dump_yaml(log_dir / "params" / "env.yaml", env_cfg)
-    dump_yaml(log_dir / "params" / "agent.yaml", agent_cfg)
 
   runner.learn(
     num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True
@@ -228,6 +236,7 @@ def main():
     tyro.extras.literal_type_from_choices(all_tasks),
     add_help=False,
     return_unknown_args=True,
+    config=mjlab.TYRO_FLAGS,
   )
 
   args = tyro.cli(
@@ -235,10 +244,7 @@ def main():
     args=remaining_args,
     default=TrainConfig.from_task(chosen_task),
     prog=sys.argv[0] + f" {chosen_task}",
-    config=(
-      tyro.conf.AvoidSubcommands,
-      tyro.conf.FlagConversionOff,
-    ),
+    config=mjlab.TYRO_FLAGS,
   )
   del remaining_args
 

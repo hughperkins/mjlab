@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 import os
 from typing import TYPE_CHECKING, Literal, cast
@@ -7,9 +9,13 @@ import mujoco_warp as mjwarp
 import torch
 import warp as wp
 
+from mjlab.managers.event_manager import RecomputeLevel
 from mjlab.sim.randomization import expand_model_fields
 from mjlab.sim.sim_data import TorchArray, WarpBridge
 from mjlab.utils.nan_guard import NanGuard, NanGuardCfg
+
+if TYPE_CHECKING:
+  from mjlab.sensor.sensor_context import SensorContext
 
 # Type aliases for better IDE support while maintaining runtime compatibility
 # At runtime, WarpBridge wraps the actual MJWarp objects.
@@ -42,6 +48,19 @@ _SOLVER_MAP = {
   "pgs": mujoco.mjtSolver.mjSOL_PGS,
 }
 
+# Maps short flag names to MuJoCo enum values.
+# Names match the XML <flag> attribute names (e.g. <flag contact="disable"/>).
+_DISABLE_FLAG_MAP: dict[str, int] = {
+  name.removeprefix("mjDSBL_").lower(): getattr(mujoco.mjtDisableBit, name).value
+  for name in dir(mujoco.mjtDisableBit)
+  if name.startswith("mjDSBL_")
+}
+_ENABLE_FLAG_MAP: dict[str, int] = {
+  name.removeprefix("mjENBL_").lower(): getattr(mujoco.mjtEnableBit, name).value
+  for name in dir(mujoco.mjtEnableBit)
+  if name.startswith("mjENBL_")
+}
+
 
 @dataclass
 class MujocoCfg:
@@ -65,7 +84,13 @@ class MujocoCfg:
   ccd_iterations: int = 50
 
   # Other.
-  gravity: tuple[float, float, float] = (0, 0, -9.81)
+  gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
+  # Global MuJoCo option flags. Names match the XML <flag> attributes
+  # (e.g. "contact", "gravity", "sensor"). See mjtDisableBit / mjtEnableBit.
+  disableflags: tuple[str, ...] = ()
+  """Disable flags to set (e.g. ``("contact",)`` to disable contacts)."""
+  enableflags: tuple[str, ...] = ()
+  """Enable flags to set (e.g. ``("energy",)`` to enable energy computation)."""
 
   def apply(self, model: mujoco.MjModel) -> None:
     """Apply configuration settings to a compiled MjModel."""
@@ -81,6 +106,18 @@ class MujocoCfg:
     model.opt.ls_iterations = self.ls_iterations
     model.opt.ls_tolerance = self.ls_tolerance
     model.opt.ccd_iterations = self.ccd_iterations
+    for flag in self.disableflags:
+      if flag not in _DISABLE_FLAG_MAP:
+        raise ValueError(
+          f"Unknown disable flag {flag!r}. Valid flags: {sorted(_DISABLE_FLAG_MAP)}"
+        )
+      model.opt.disableflags |= _DISABLE_FLAG_MAP[flag]
+    for flag in self.enableflags:
+      if flag not in _ENABLE_FLAG_MAP:
+        raise ValueError(
+          f"Unknown enable flag {flag!r}. Valid flags: {sorted(_ENABLE_FLAG_MAP)}"
+        )
+      model.opt.enableflags |= _ENABLE_FLAG_MAP[flag]
 
 
 @dataclass(kw_only=True)
@@ -131,6 +168,7 @@ class Simulation:
     self.wp_device = wp.get_device(self.device)
     self.num_envs = num_envs
     self._default_model_fields: dict[str, torch.Tensor] = {}
+    self._expanded_fields: set[str] = set()
 
     # MuJoCo model and data.
     self._mj_model = model
@@ -157,6 +195,7 @@ class Simulation:
 
     self._model_bridge = WarpBridge(self._wp_model, nworld=self.num_envs)
     self._data_bridge = WarpBridge(self._wp_data)
+    self._sensor_context: SensorContext | None = None
 
     self.use_cuda_graph = self.wp_device.is_cuda and wp.is_mempool_enabled(
       self.wp_device
@@ -184,6 +223,7 @@ class Simulation:
     self.step_graph = None
     self.forward_graph = None
     self.reset_graph = None
+    self.sense_graph = None
     if self.use_cuda_graph:
       with wp.ScopedDevice(self.wp_device):
         with wp.ScopedCapture() as capture:
@@ -195,6 +235,10 @@ class Simulation:
         with wp.ScopedCapture() as capture:
           mjwarp.reset_data(self.wp_model, self.wp_data, reset=self._reset_mask_wp)
         self.reset_graph = capture.graph
+        if self._sensor_context is not None:
+          with wp.ScopedCapture() as capture:
+            self._sense_kernel()
+          self.sense_graph = capture.graph
 
   # Properties.
 
@@ -227,6 +271,11 @@ class Simulation:
     """Default values for expanded model fields, used in domain randomization."""
     return self._default_model_fields
 
+  @property
+  def expanded_fields(self) -> set[str]:
+    """Names of model fields that have been expanded for per-env DR."""
+    return self._expanded_fields
+
   # Methods.
 
   def expand_model_fields(self, fields: tuple[str, ...]) -> None:
@@ -239,7 +288,11 @@ class Simulation:
       raise ValueError(f"Fields not found in model: {invalid_fields}")
 
     expand_model_fields(self._wp_model, self.num_envs, list(fields))
+    self._expanded_fields.update(fields)
     self._model_bridge.clear_cache()
+
+    if self._sensor_context is not None:
+      self._sensor_context.recreate(self._mj_model, self._expanded_fields)
 
     # Field expansion allocates new arrays and replaces them via setattr. The
     # CUDA graph captured the old memory addresses, so we must recreate it.
@@ -262,6 +315,19 @@ class Simulation:
         default_value, dtype=model_field.dtype, device=self.device
       ).clone()
     return self._default_model_fields[field]
+
+  def recompute_constants(self, level: RecomputeLevel) -> None:
+    """Recompute derived model constants after domain randomization.
+
+    Args:
+      level: Which constants to recompute. ``set_const`` is the most
+        expensive (covers body_mass changes), ``set_const_0`` covers
+        qpos0/body_inertia/dof_armature changes, and ``set_const_fixed``
+        is the cheapest (covers body_gravcomp changes).
+    """
+    fn = getattr(mjwarp, level.name)
+    with wp.ScopedDevice(self.wp_device):
+      fn(self._wp_model, self._wp_data)
 
   def forward(self) -> None:
     with wp.ScopedDevice(self.wp_device):
@@ -291,7 +357,52 @@ class Simulation:
       else:
         mjwarp.reset_data(self.wp_model, self.wp_data, reset=self._reset_mask_wp)
 
+  def set_sensor_context(self, ctx: SensorContext) -> None:
+    """Wire a SensorContext for camera/raycast sensing.
+
+    Automatically re-captures CUDA graphs so the sense_graph includes
+    the new sensor kernels.
+    """
+    self._sensor_context = ctx
+    self.create_graph()
+
+  def sense(self) -> None:
+    """Execute the sense pipeline: prepare -> graph -> finalize.
+
+    Runs BVH refit, camera rendering, and raycasting in a single
+    CUDA graph launch. Should be called once per env step, right
+    before observation computation.
+    """
+    if self._sensor_context is None:
+      return
+
+    ctx = self._sensor_context
+    ctx.prepare()
+
+    with wp.ScopedDevice(self.wp_device):
+      if self.use_cuda_graph and self.sense_graph is not None:
+        wp.capture_launch(self.sense_graph)
+      else:
+        self._sense_kernel()
+
+    ctx.finalize()
+
   # Private methods.
+
+  def _sense_kernel(self) -> None:
+    """GPU kernel sequence for sensing (captured in sense_graph)."""
+    assert self._sensor_context is not None
+    ctx = self._sensor_context
+    rc = ctx.render_context
+
+    mjwarp.refit_bvh(self.wp_model, self.wp_data, rc)
+
+    if ctx.has_cameras:
+      mjwarp.render(self.wp_model, self.wp_data, rc)
+      ctx.unpack_rgb()
+
+    for sensor in ctx.raycast_sensors:
+      sensor.raycast_kernel(rc=rc)
 
   def _should_use_cuda_graph(self) -> bool:
     """Determine if CUDA graphs can be used based on device and driver version."""
