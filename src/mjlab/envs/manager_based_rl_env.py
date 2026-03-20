@@ -460,8 +460,9 @@ class ManagerBasedRlEnv:
       self.scene.update(dt=self.physics_dt)
       if self.cfg.profiler.dump_contacts:
         wp.synchronize_device(self.sim.wp_device)
-        ncon = int(self.sim.wp_data.nacon.numpy()[0])
-        nefc = int(self.sim.wp_data.nefc.numpy().sum())
+        # nacon is a global count across all worlds; nefc is per-world
+        ncon = float(self.sim.wp_data.nacon.numpy()[0]) / self.num_envs
+        nefc = float(self.sim.wp_data.nefc.numpy().mean())
         self._contact_log.append((self._contact_step, ncon, nefc))
         self._contact_step += 1
       if self._profiler is not None:
